@@ -1,0 +1,78 @@
+#cloud-config
+
+ssh_pwauth: false
+
+users:
+  - name: ops
+    groups: sudo
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    lock_passwd: true
+    ssh_authorized_keys:
+      - ${ssh_public_key}
+
+locale: en_US.UTF-8
+
+timezone: Europe/Berlin
+
+ntp:
+  enabled: true
+
+write_files:
+  - path: /etc/ssh/sshd_config.d/99-hardening.conf
+    content: |
+      PasswordAuthentication no
+      KbdInteractiveAuthentication no
+      PermitRootLogin no
+      X11Forwarding no
+      AllowAgentForwarding no
+
+  - path: /etc/sysctl.d/99-swap.conf
+    content: |
+      vm.swappiness=1
+
+  - path: /etc/apt/apt.conf.d/99-no-unattended
+    content: |
+      APT::Periodic::Unattended-Upgrade "0";
+      APT::Periodic::Update-Package-Lists "0";
+
+  - path: /etc/apt/preferences.d/no-unattended-upgrades
+    content: |
+      Package: unattended-upgrades
+      Pin: release *
+      Pin-Priority: -1
+
+runcmd:
+  - systemctl mask unattended-upgrades.service
+  - apt-get remove -y unattended-upgrades || true
+
+  # Set Vultr APT mirror
+  - sed -i 's|http://archive.ubuntu.com/ubuntu|http://ams.clouds.archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || sed -i 's|http://archive.ubuntu.com/ubuntu|http://ams.clouds.archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list 2>/dev/null || true
+  - apt-get update
+
+  # Install base packages
+  - apt-get install -y curl git jq ufw net-tools rsync unzip ca-certificates vim-tiny dnsutils ncdu lsof tcpdump atop
+
+  # Configure UFW
+  - ufw default deny incoming
+  - ufw default allow outgoing
+  - ufw allow 22/tcp
+  - ufw --force enable
+
+  # Apply sysctl
+  - sysctl -p /etc/sysctl.d/99-swap.conf
+
+  # Ensure ops user has SSH key (belt-and-suspenders, some providers
+  # don't reliably process ssh_authorized_keys in the users block)
+  - mkdir -p /home/ops/.ssh
+  - echo '${ssh_public_key}' >> /home/ops/.ssh/authorized_keys
+  - sort -u -o /home/ops/.ssh/authorized_keys /home/ops/.ssh/authorized_keys
+  - chmod 700 /home/ops/.ssh
+  - chmod 600 /home/ops/.ssh/authorized_keys
+  - chown -R ops:ops /home/ops/.ssh
+
+  # Remove root SSH access
+  - rm -f /root/.ssh/authorized_keys
+
+  # Restart sshd to apply hardening
+  - systemctl restart sshd
