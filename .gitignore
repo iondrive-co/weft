@@ -4,3 +4,4 @@
 .terraform.lock.hcl
 .env
 terraform.tfvars
+weft.tfplan

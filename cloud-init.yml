@@ -1,5 +1,9 @@
 #cloud-config
 
+hostname: ${hostname}
+preserve_hostname: false
+manage_etc_hosts: localhost
+
 ssh_pwauth: false
 
 users:
@@ -13,10 +17,16 @@ users:
 
 locale: en_US.UTF-8
 
-timezone: Europe/Berlin
+timezone: ${timezone}
 
 ntp:
   enabled: true
+%{ if length(ntp_servers) > 0 ~}
+  servers:
+%{ for server in ntp_servers ~}
+    - ${server}
+%{ endfor ~}
+%{ endif ~}
 
 write_files:
   - path: /etc/ssh/sshd_config.d/99-hardening.conf
@@ -46,9 +56,28 @@ runcmd:
   - systemctl mask unattended-upgrades.service
   - apt-get remove -y unattended-upgrades || true
 
-  # Set Vultr APT mirror
-  - sed -i 's|http://archive.ubuntu.com/ubuntu|http://ams.clouds.archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || sed -i 's|http://archive.ubuntu.com/ubuntu|http://ams.clouds.archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list 2>/dev/null || true
-  - apt-get update
+  # Point APT at a nearby mirror (Vultr images ship the generic one; AWS AMIs
+  # already have a regional mirror, so apt_mirror is empty there). Reverts to
+  # the image default if the mirror turns out not to work.
+  - |
+    mirror='${apt_mirror}'
+    files='/etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list'
+    if [ -n "$mirror" ]; then
+      for f in $files; do
+        if [ -f "$f" ]; then
+          sed -i.weft-bak "s|http://archive.ubuntu.com/ubuntu|$mirror|g" "$f"
+        fi
+      done
+      if ! apt-get update; then
+        echo "weft: APT mirror $mirror failed, reverting to the image default"
+        for f in $files; do
+          if [ -f "$f.weft-bak" ]; then mv "$f.weft-bak" "$f"; fi
+        done
+        apt-get update
+      fi
+    else
+      apt-get update
+    fi
 
   # Install base packages
   - apt-get install -y curl git jq ufw net-tools rsync unzip ca-certificates vim-tiny dnsutils ncdu lsof tcpdump atop
@@ -56,7 +85,13 @@ runcmd:
   # Configure UFW
   - ufw default deny incoming
   - ufw default allow outgoing
+%{ if length(ssh_allowed_cidrs) == 0 || contains(ssh_allowed_cidrs, "0.0.0.0/0") ~}
   - ufw allow 22/tcp
+%{ else ~}
+%{ for cidr in ssh_allowed_cidrs ~}
+  - ufw allow from ${cidr} to any port 22 proto tcp
+%{ endfor ~}
+%{ endif ~}
   - ufw --force enable
 
   # Apply sysctl
