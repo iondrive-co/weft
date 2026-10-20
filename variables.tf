@@ -90,3 +90,9 @@ variable "aws_subnet_id" {
   type        = string
   default     = null
 }
+
+variable "bare_metal" {
+  description = "Vultr only: a dedicated bare-metal server (plan vbm-*) instead of a cloud instance."
+  type        = bool
+  default     = false
+}

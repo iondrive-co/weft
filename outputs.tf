@@ -2,6 +2,7 @@ locals {
   # Exactly one of these lists holds a server, so `one` picks it out.
   server_ip = one(concat(
     vultr_instance.server[*].main_ip,
+    vultr_bare_metal_server.server[*].main_ip,
     aws_instance.server[*].public_ip,
   ))
 }
