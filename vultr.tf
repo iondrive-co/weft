@@ -18,6 +18,11 @@ resource "vultr_instance" "server" {
   ssh_key_ids = [vultr_ssh_key.weft[0].id]
 
   user_data = local.user_data
+
+  # user_data forces replacement: an edit to cloud-init.yml must reach new servers only, never rebuild a running one
+  lifecycle {
+    ignore_changes = [user_data]
+  }
 }
 
 # A dedicated (bare-metal) server instead of a cloud instance, when `bare_metal` is set (hermes Dev #685: a Hyperliquid
@@ -34,4 +39,8 @@ resource "vultr_bare_metal_server" "server" {
   mdisk_mode  = "jbod"
 
   user_data = local.user_data
+
+  lifecycle {
+    ignore_changes = [user_data]
+  }
 }

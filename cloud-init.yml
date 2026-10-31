@@ -91,6 +91,8 @@ runcmd:
 %{ for cidr in ssh_allowed_cidrs ~}
   - ufw allow from ${cidr} to any port 22 proto tcp
 %{ endfor ~}
+  # Vultr's Ubuntu image ships with 22/tcp open to all, which the rules above only add to
+  - ufw delete allow 22/tcp || true
 %{ endif ~}
   - ufw --force enable
 
