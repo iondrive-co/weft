@@ -91,6 +91,8 @@ All commands go through `./weft.sh`:
 | `./weft.sh destroy`    | Tear down the server                     |
 | `./weft.sh ssh`        | SSH into the server as `ops`             |
 | `./weft.sh ip`         | Print the server's IP address            |
+| `./weft.sh hosts`      | List provisioned servers across workspaces (`--json`) |
+| `./weft.sh workspace`  | Manage workspaces (`current\|list\|ensure\|delete`; per-workspace vars live in gitignored `workspaces/<name>.tfvars`) |
 | `./weft.sh cloud`      | Print configured vs provisioned cloud    |
 | `./weft.sh status`     | Show current Terraform state             |
 | `./weft.sh cloud-init` | Check cloud-init progress on server      |

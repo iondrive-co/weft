@@ -121,8 +121,13 @@ resource "aws_instance" "server" {
   subnet_id                   = local.aws_subnet_id
   associate_public_ip_address = true
 
-  user_data                   = local.user_data
-  user_data_replace_on_change = true
+  user_data = local.user_data
+
+  # Parity with vultr.tf: an edit to cloud-init.yml or a newer Ubuntu AMI must reach new servers only,
+  # never rebuild a running one.
+  lifecycle {
+    ignore_changes = [ami, user_data]
+  }
 
   root_block_device {
     volume_type           = "gp3"

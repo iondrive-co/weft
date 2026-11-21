@@ -6,6 +6,7 @@ cd "$WEFT_DIR"
 source ./lib.sh
 
 env_load
+[ -n "${WEFT_WORKSPACE:-}" ] && export TF_WORKSPACE="$WEFT_WORKSPACE"
 
 cmd="${1:-help}"
 shift || true
@@ -15,6 +16,8 @@ configured() { [ -n "$(env_get TF_VAR_cloud)" ] && [ -d .terraform ]; }
 
 case "$cmd" in
   setup)
+    ws="${TF_WORKSPACE:-$(terraform workspace show 2>/dev/null || echo default)}"
+    [ "$ws" = "default" ] || die "Refusing 'setup' in non-default workspace '${ws}': switch to 'default' first."
     exec ./setup.sh
     ;;
 esac
@@ -22,6 +25,9 @@ esac
 case "$cmd" in
   plan|apply|destroy|ssh|ip|status|cloud-init|test)
     if ! configured; then
+      if [ ! -t 0 ]; then
+        die "Weft isn't set up yet (non-interactive; run './weft.sh setup')."
+      fi
       warn "Weft isn't set up yet -- starting setup."
       exec ./setup.sh
     fi
@@ -38,23 +44,71 @@ server_ip() {
   printf '%s' "$ip"
 }
 
+WORKSPACE_VAR_FILE=""
+resolve_workspace_var_file() {
+  local ws has_explicit=0 arg prev=""
+  WORKSPACE_VAR_FILE=""
+  ws="${TF_WORKSPACE:-$(terraform workspace show 2>/dev/null || echo default)}"
+  [ "$ws" = "default" ] && return 0
+  if [ -f "workspaces/${ws}.tfvars" ]; then
+    WORKSPACE_VAR_FILE="workspaces/${ws}.tfvars"
+    return 0
+  fi
+  for arg in "$@"; do
+    if [ "$prev" = "-var" ]; then
+      case "$arg" in
+        hostname=*) has_explicit=1 ;;
+      esac
+      prev=""
+      continue
+    fi
+    case "$arg" in
+      -var-file|-var-file=*|-var=hostname=*) has_explicit=1 ;;
+      -var) prev="-var" ;;
+    esac
+  done
+  if [ "$has_explicit" -eq 1 ]; then
+    return 0
+  fi
+  die "Refusing '${cmd}' on non-default workspace '${ws}': missing workspaces/${ws}.tfvars (and no -var-file or -var=hostname=... passed); plain terraform.tfvars would target another server."
+}
+
 case "$cmd" in
   init)
     terraform init "$@"
     ;;
 
   plan)
-    terraform plan "$@"
+    resolve_workspace_var_file "$@"
+    if [ -n "$WORKSPACE_VAR_FILE" ]; then
+      terraform plan -var-file="$WORKSPACE_VAR_FILE" "$@"
+    else
+      terraform plan "$@"
+    fi
     ;;
 
   apply)
-    terraform apply "$@"
+    resolve_workspace_var_file "$@"
+    rc=0
+    if [ -n "$WORKSPACE_VAR_FILE" ]; then
+      terraform apply -var-file="$WORKSPACE_VAR_FILE" "$@" || rc=$?
+    else
+      terraform apply "$@" || rc=$?
+    fi
+    if [ "$rc" -ne 0 ]; then
+      exit "$rc"
+    fi
     ip="$(terraform output -raw server_ip 2>/dev/null)" || true
     [ -n "$ip" ] && { printf '\n'; ok "Server at ${ip}"; info "  ./weft.sh ssh   (wait a minute for cloud-init)"; }
     ;;
 
   destroy)
-    terraform destroy "$@"
+    resolve_workspace_var_file "$@"
+    if [ -n "$WORKSPACE_VAR_FILE" ]; then
+      terraform destroy -var-file="$WORKSPACE_VAR_FILE" "$@"
+    else
+      terraform destroy "$@"
+    fi
     ;;
 
   ssh)
@@ -66,6 +120,51 @@ case "$cmd" in
   ip)
     server_ip
     printf '\n'
+    ;;
+
+  hosts)
+    exec python3 "$WEFT_DIR/weft_hosts.py" --weft-dir "$WEFT_DIR" "$@"
+    ;;
+
+  workspace)
+    sub="${1:-list}"
+    shift || true
+    case "$sub" in
+      current)
+        if [ -n "${TF_WORKSPACE:-}" ]; then
+          printf '%s\n' "$TF_WORKSPACE"
+        else
+          terraform workspace show
+        fi
+        ;;
+      list)
+        unset TF_WORKSPACE
+        terraform workspace list "$@"
+        ;;
+      ensure)
+        ws="${1:?workspace name required}"
+        unset TF_WORKSPACE
+        cur="$(terraform workspace show)" || exit 1
+        rc=0
+        terraform workspace select -or-create "$ws" >/dev/null || rc=$?
+        if [ "$rc" -eq 0 ] && [ "$cur" != "$ws" ]; then
+          terraform workspace select "$cur" >/dev/null || rc=$?
+        fi
+        exit "$rc"
+        ;;
+      delete)
+        ws="${1:?workspace name required}"
+        unset TF_WORKSPACE
+        cur="$(terraform workspace show)"
+        if [ "$cur" = "$ws" ]; then
+          terraform workspace select default >/dev/null
+        fi
+        terraform workspace delete "$ws"
+        ;;
+      *)
+        die "Usage: ./weft.sh workspace [current|list|ensure NAME|delete NAME]"
+        ;;
+    esac
     ;;
 
   cloud)
@@ -94,7 +193,9 @@ case "$cmd" in
     ;;
 
   test)
-    exec ./smoke-test.sh "$(env_get TF_VAR_cloud)" "$@"
+    smoke_ws="${WEFT_SMOKE_WORKSPACE:-weft-smoke}"
+    "$WEFT_DIR/weft.sh" workspace ensure "$smoke_ws" || exit 1
+    TF_WORKSPACE="$smoke_ws" exec ./smoke-test.sh "$(env_get TF_VAR_cloud)" "$@"
     ;;
 
   help|*)
@@ -109,6 +210,8 @@ Usage: ./weft.sh <command> [terraform args...]
   destroy     Tear down the server
   ssh         SSH into the server as ops
   ip          Print the server IP
+  hosts       List provisioned servers across all workspaces (--json)
+  workspace   Manage Terraform workspaces (current|list|ensure|delete)
   cloud       Print which cloud is configured/provisioned
   status      Show current Terraform state
   cloud-init  Check cloud-init progress on the server

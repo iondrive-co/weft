@@ -25,9 +25,9 @@ resource "vultr_instance" "server" {
   }
 }
 
-# A dedicated (bare-metal) server instead of a cloud instance, when `bare_metal` is set (hermes Dev #685: a Hyperliquid
-# non-validating node needs 24+ cores and NVMe). Billed hourly up to the plan's monthly price; `plan` is a vbm-* id.
-# mdisk_mode jbod leaves each disk on its own, so the second NVMe can hold the node's data apart from the OS.
+# A dedicated (bare-metal) server instead of a cloud instance, when `bare_metal` is set (for workloads that need many
+# cores or local NVMe). Billed hourly up to the plan's monthly price; `plan` is a vbm-* id.
+# mdisk_mode jbod leaves each disk on its own, so the second NVMe can hold data apart from the OS.
 resource "vultr_bare_metal_server" "server" {
   count       = local.is_vultr && var.bare_metal ? 1 : 0
   region      = local.region

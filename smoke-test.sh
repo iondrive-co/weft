@@ -30,6 +30,20 @@ done
 
 if [ -f .env ]; then set -a; source .env; set +a; fi
 
+# Always run in a dedicated smoke workspace so an active workspace's live server is never touched.
+SMOKE_WS="${WEFT_SMOKE_WORKSPACE:-weft-smoke}"
+if [ "${TF_WORKSPACE:-}" != "$SMOKE_WS" ]; then
+  cur_ws="$(unset TF_WORKSPACE; terraform workspace show 2>/dev/null || echo default)"
+  (
+    unset TF_WORKSPACE
+    terraform workspace select -or-create "$SMOKE_WS" >/dev/null || exit 1
+    if [ "$cur_ws" != "$SMOKE_WS" ]; then
+      terraform workspace select "$cur_ws" >/dev/null || exit 1
+    fi
+  ) || exit 1
+  export TF_WORKSPACE="$SMOKE_WS"
+fi
+
 # The cloud under test wins over .env and terraform.tfvars alike, so pass it as
 # a -var (highest precedence) rather than an environment variable.
 HOSTNAME_VAR="weft-smoke"
@@ -45,7 +59,7 @@ cleanup() {
   if [ "$KEEP" = 1 ]; then
     say "Leaving the server up (--keep)"
     echo "Tear it down with:"
-    echo "  terraform destroy -auto-approve ${TF_ARGS[*]}"
+    echo "  TF_WORKSPACE=${SMOKE_WS} terraform destroy -auto-approve ${TF_ARGS[*]}"
   else
     say "Destroying"
     terraform destroy -auto-approve "${TF_ARGS[@]}" >/dev/null 2>&1 \

@@ -4,4 +4,6 @@
 .terraform.lock.hcl
 .env
 terraform.tfvars
+workspaces/
+__pycache__/
 weft.tfplan
