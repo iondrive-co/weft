@@ -99,6 +99,17 @@ resource "aws_security_group" "weft" {
     cidr_blocks = var.ssh_allowed_cidrs
   }
 
+  dynamic "ingress" {
+    for_each = var.tunnel ? [var.tunnel_port] : []
+    content {
+      description = "weft tunnel (WireGuard)"
+      from_port   = ingress.value
+      to_port     = ingress.value
+      protocol    = "udp"
+      cidr_blocks = ["0.0.0.0/0"]
+    }
+  }
+
   egress {
     from_port        = 0
     to_port          = 0
@@ -140,5 +151,15 @@ resource "aws_instance" "server" {
   metadata_options {
     http_endpoint = "enabled"
     http_tokens   = "required"
+  }
+}
+
+# static_ip on AWS: an Elastic IP that stays when the instance is rebuilt (./weft.sh rebuild re-associates it).
+resource "aws_eip" "static" {
+  count    = local.is_aws && var.static_ip ? 1 : 0
+  domain   = "vpc"
+  instance = aws_instance.server[0].id
+  tags = {
+    Name = "${var.hostname}-static"
   }
 }

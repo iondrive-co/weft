@@ -7,6 +7,8 @@
 #   ./smoke-test.sh aws --keep -var="region=eu-west-1"
 #
 # --keep leaves the server running (and tells you how to get rid of it).
+# WEFT_SMOKE_TUNNEL=1 also gives the server a static IP, the cloud firewall and the tunnel egress, and checks them
+# (a reserved IP is billed by the hour like the server, and released again by the destroy at the end).
 set -uo pipefail
 
 WEFT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -48,9 +50,17 @@ fi
 # a -var (highest precedence) rather than an environment variable.
 HOSTNAME_VAR="weft-smoke"
 TF_ARGS+=("-var=cloud=${CLOUD}" "-var=hostname=${HOSTNAME_VAR}")
+# The checks below test these values, so ask for them whatever terraform.tfvars says.
+TF_ARGS+=("-var=timezone=Europe/Berlin" "-var=ssh_tcp_forwarding=false")
+TUNNEL="${WEFT_SMOKE_TUNNEL:-0}"
+if [ "$TUNNEL" = 1 ]; then
+  TF_ARGS+=("-var=tunnel=true" "-var=static_ip=true" "-var=vultr_firewall=true")
+fi
 
 SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null
-          -o LogLevel=ERROR -o ConnectTimeout=10)
+          -o LogLevel=ERROR -o ConnectTimeout=10
+          # cloud-init's firewall and sshd changes can drop a session mid-boot without closing it: give up on it.
+          -o ServerAliveInterval=5 -o ServerAliveCountMax=3)
 
 say() { printf '\n=== %s ===\n' "$1"; }
 
@@ -62,8 +72,14 @@ cleanup() {
     echo "  TF_WORKSPACE=${SMOKE_WS} terraform destroy -auto-approve ${TF_ARGS[*]}"
   else
     say "Destroying"
-    terraform destroy -auto-approve "${TF_ARGS[@]}" >/dev/null 2>&1 \
-      && echo "[ok] destroyed" \
+    # A reserved IP can refuse deletion while its instance is still detaching, so try a few times.
+    local try destroyed=0
+    for try in 1 2 3; do
+      if terraform destroy -auto-approve "${TF_ARGS[@]}" >/dev/null 2>&1; then destroyed=1; break; fi
+      echo "[..] destroy attempt ${try} failed; retrying"
+      sleep 15
+    done
+    [ "$destroyed" = 1 ] && echo "[ok] destroyed" \
       || { echo "[!!] destroy failed -- check the console, you may be paying for a server"; rc=1; }
   fi
   exit "$rc"
@@ -78,6 +94,11 @@ fi
 
 IP="$(terraform output -raw server_ip)"
 echo "[ok] server at ${IP}"
+if [ "$TUNNEL" = 1 ]; then
+  STATIC="$(terraform output -raw static_ip 2>/dev/null)"
+  [ -n "$STATIC" ] && [ "$STATIC" = "$IP" ] && echo "[ok] server_ip is the static IP" \
+    || { echo "[!!] static_ip '${STATIC}' is not server_ip '${IP}'"; exit 1; }
+fi
 
 say "Waiting for SSH"
 for i in $(seq 1 60); do
@@ -93,8 +114,8 @@ say "Waiting for cloud-init"
 ssh "${SSH_OPTS[@]}" "ops@${IP}" 'sudo cloud-init status --wait >/dev/null 2>&1; sudo cloud-init status' || true
 
 say "Checks"
-ssh "${SSH_OPTS[@]}" "ops@${IP}" 'bash -s' "$CLOUD" "$HOSTNAME_VAR" <<'REMOTE'
-cloud="$1"; want_hostname="$2"
+ssh "${SSH_OPTS[@]}" "ops@${IP}" 'bash -s' "$CLOUD" "$HOSTNAME_VAR" "$TUNNEL" "$IP" <<'REMOTE'
+cloud="$1"; want_hostname="$2"; tunnel="$3"; want_ip="$4"
 pass=0; fail=0
 
 check() {
@@ -116,6 +137,15 @@ check "sshd: root login off"          "sudo sshd -T | grep -qx 'permitrootlogin 
 check "sshd: X11 forwarding off"      "sudo sshd -T | grep -qx 'x11forwarding no'"
 check "sshd: agent forwarding off"    "sudo sshd -T | grep -qx 'allowagentforwarding no'"
 check "root authorized_keys gone"     "sudo test ! -s /root/.ssh/authorized_keys"
+check "sshd: only ops may log in"     "sudo sshd -T | grep -qx 'allowusers ops'"
+check "sshd: tcp forwarding off"      "sudo sshd -T | grep -qx 'allowtcpforwarding no'"
+check "sshd: max 3 auth tries"        "sudo sshd -T | grep -qx 'maxauthtries 3'"
+check "sshd: modern kex only"         "! sudo sshd -T | grep '^kexalgorithms' | grep -q 'sha1\\|group14\\|ecdh-sha2'"
+check "sshd running"                  "systemctl is-active --quiet ssh || systemctl is-active --quiet sshd"
+check "sysctl: no redirects"          "[ \"\$(sysctl -n net.ipv4.conf.all.accept_redirects)\" = 0 ]"
+check "sysctl: kptr restricted"       "[ \"\$(sysctl -n kernel.kptr_restrict)\" = 2 ]"
+check "sysctl: unprivileged bpf off"  "[ \"\$(sysctl -n kernel.unprivileged_bpf_disabled)\" != 0 ]"
+check "ufw denies routed by default"  "sudo ufw status verbose | grep -q 'deny (routed)\\|disabled (routed)'"
 
 check "ufw active"                    "sudo ufw status verbose | grep -q '^Status: active'"
 check "ufw denies incoming"           "sudo ufw status verbose | grep -q 'Default: deny (incoming)'"
@@ -133,7 +163,9 @@ check "unattended-upgrades removed"   "! dpkg -s unattended-upgrades 2>/dev/null
 check "apt update works"              "sudo apt-get -qq update"
 
 if [ "$cloud" = "vultr" ]; then
-  check "apt uses the cloud mirror"   "grep -rq clouds.archive.ubuntu.com /etc/apt/sources.list.d/ /etc/apt/sources.list"
+  # Older Vultr images used the generic archive.ubuntu.com, which weft rewrites to the cloud mirror; newer ones ship
+  # Vultr's own mirror. Either way, not the generic archive.
+  check "apt uses a nearby mirror"    "! grep -rsqE --include='*.sources' --include='*.list' '//(us\\.)?archive\\.ubuntu\\.com' /etc/apt/sources.list.d/ /etc/apt/sources.list"
 else
   check "apt kept the ec2 mirror"     "grep -rq ec2.archive.ubuntu.com /etc/apt/sources.list.d/ /etc/apt/sources.list"
   check "amazon time sync configured" "grep -rq 169.254.169.123 /etc/systemd/timesyncd.conf.d/ /etc/chrony/ 2>/dev/null"
@@ -141,6 +173,22 @@ else
     "[ \"\$(curl -s -o /dev/null -w '%{http_code}' -m 5 http://169.254.169.254/latest/meta-data/)\" = 401 ]"
   check "IMDSv2 works" \
     "t=\$(curl -sX PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' -m 5 http://169.254.169.254/latest/api/token) && curl -sf -H \"X-aws-ec2-metadata-token: \$t\" -m 5 http://169.254.169.254/latest/meta-data/instance-id"
+fi
+
+if [ "$tunnel" = 1 ]; then
+  check "tunnel: egress public IP is the static IP" "[ \"\$(curl -4 -s -m 10 https://api.ipify.org)\" = '${want_ip}' ]"
+  check "tunnel: wg0 up"                   "sudo wg show wg0 listen-port | grep -qx 51820"
+  check "tunnel: server key private"       "[ \"\$(sudo stat -c %a /etc/wireguard/server.key)\" = 600 ]"
+  check "tunnel: egress filter loaded"     "sudo nft list table inet weft_egress | grep -q masquerade"
+  check "tunnel: forwarding on"            "[ \"\$(sysctl -n net.ipv4.ip_forward)\" = 1 ]"
+  check "tunnel: ufw allows the port"      "sudo ufw status | grep -q '51820/udp'"
+  check "tunnel: ufw routes wg0 out"       "sudo ufw status | grep -q 'on wg0'"
+  check "tunnel: weft-peer pubkey"         "sudo weft-peer pubkey | grep -Eq '^[A-Za-z0-9+/]{43}=\$'"
+  key="$(wg genkey | wg pubkey)"
+  check "tunnel: weft-peer add applies live" \
+    "sudo weft-peer add smoke ${key} 10.77.0.9 && sudo wg show wg0 allowed-ips | grep -q '10.77.0.9/32'"
+  check "tunnel: server key survives add"  "sudo wg show wg0 private-key | grep -q ."
+  check "tunnel: weft-peer remove"         "sudo weft-peer remove smoke && ! sudo wg show wg0 peers | grep -q ."
 fi
 
 printf '\n  %d passed, %d failed\n' "$pass" "$fail"

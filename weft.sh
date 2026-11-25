@@ -23,7 +23,7 @@ case "$cmd" in
 esac
 
 case "$cmd" in
-  plan|apply|destroy|ssh|ip|status|cloud-init|test)
+  plan|apply|destroy|rebuild|ssh|ip|status|cloud-init|test|tunnel)
     if ! configured; then
       if [ ! -t 0 ]; then
         die "Weft isn't set up yet (non-interactive; run './weft.sh setup')."
@@ -104,11 +104,116 @@ case "$cmd" in
 
   destroy)
     resolve_workspace_var_file "$@"
+    # A static IP is what allowlists know the server by; releasing it is never a side effect.
+    if terraform state list 2>/dev/null | grep -Eq '^(vultr_reserved_ip|aws_eip)\.static'; then
+      if [ "${WEFT_RELEASE_STATIC_IP:-}" != 1 ]; then
+        die "Refusing 'destroy': this workspace holds static IP $(terraform output -raw static_ip 2>/dev/null) and destroy would release it for good. Use './weft.sh rebuild' to replace only the server, or set WEFT_RELEASE_STATIC_IP=1 to give the IP up."
+      fi
+      warn "WEFT_RELEASE_STATIC_IP=1: the static IP $(terraform output -raw static_ip 2>/dev/null) will be released."
+    fi
     if [ -n "$WORKSPACE_VAR_FILE" ]; then
       terraform destroy -var-file="$WORKSPACE_VAR_FILE" "$@"
     else
       terraform destroy "$@"
     fi
+    ;;
+
+  rebuild)
+    # A fresh server from the current cloud-init, keeping everything else (the static IP above all).
+    resolve_workspace_var_file "$@"
+    target="$(terraform state list 2>/dev/null | grep -E '^(vultr_instance|vultr_bare_metal_server|aws_instance)\.server\[0\]$' | head -n 1)"
+    [ -n "$target" ] || die "No server in this workspace to rebuild."
+    terraform state list 2>/dev/null | grep -Eq '^(vultr_reserved_ip|aws_eip)\.static' \
+      || warn "This workspace has no static IP: the rebuilt server gets a new address."
+    warn "Rebuilding ${target}: its disk is wiped, and a tunnel server gets a new WireGuard key (clients need 'tunnel client-config' and 'tunnel add-peer' again)."
+    if [ -n "$WORKSPACE_VAR_FILE" ]; then
+      terraform apply -replace="$target" -var-file="$WORKSPACE_VAR_FILE" "$@"
+    else
+      terraform apply -replace="$target" "$@"
+    fi
+    ;;
+
+  tunnel)
+    # Client side of a tunnel egress: everything here runs over SSH as ops, so only public keys ever move.
+    sub="${1:-help}"; shift || true
+    tunnel_json="$(terraform output -json tunnel 2>/dev/null)" || tunnel_json=null
+    if [ "$sub" != help ] && { [ -z "$tunnel_json" ] || [ "$tunnel_json" = null ]; }; then
+      die "This workspace's server is not a tunnel egress (set tunnel = true in its tfvars and apply)."
+    fi
+    if [ "$sub" != help ]; then
+      tunnel_host="$(server_ip)" || exit 1
+    fi
+    remote() { ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=10 \
+      -o ServerAliveInterval=5 -o ServerAliveCountMax=3 "ops@${tunnel_host}" "$@"; }
+    case "$sub" in
+      pubkey) remote sudo weft-peer pubkey ;;
+      peers) remote sudo weft-peer list ;;
+      add-peer)
+        [ $# -eq 3 ] || die "usage: ./weft.sh tunnel add-peer NAME CLIENT_PUBKEY ADDRESS"
+        remote sudo weft-peer add "$(printf '%q' "$1")" "$(printf '%q' "$2")" "$(printf '%q' "$3")"
+        ;;
+      remove-peer)
+        [ $# -eq 1 ] || die "usage: ./weft.sh tunnel remove-peer NAME"
+        remote sudo weft-peer remove "$(printf '%q' "$1")"
+        ;;
+      handshakes) remote sudo wg show wg0 latest-handshakes ;;
+      client-config)
+        # client-config NAME ADDRESS --cgroup PATH [--cgroup PATH]... [--bypass CIDR]... [--on-failure closed|direct]
+        [ $# -ge 2 ] || die "usage: ./weft.sh tunnel client-config NAME ADDRESS --cgroup PATH [--cgroup PATH]... [--bypass IP_OR_CIDR]... [--on-failure closed|direct]"
+        name="$1"; address="$2"; shift 2
+        server_pub="$(remote sudo weft-peer pubkey)" || die "could not read the server's public key"
+        python3 - "$tunnel_json" "$name" "$address" "$server_pub" "$@" <<'PY'
+import ipaddress, json, sys
+tun, name, address, server_pub, *rest = sys.argv[1:]
+tun = json.loads(tun)
+cgroups, bypass, on_failure = [], [], None
+while rest:
+    flag, value, rest = rest[0], (rest[1] if len(rest) > 1 else None), rest[2:]
+    if value is None or flag not in ("--cgroup", "--bypass", "--on-failure"):
+        sys.exit(f"weft: unexpected argument {flag!r}")
+    if flag == "--on-failure":
+        if value not in ("closed", "direct"):
+            sys.exit(f"weft: --on-failure {value!r}: use closed or direct")
+        on_failure = value
+    else:
+        (cgroups if flag == "--cgroup" else bypass).append(value)
+if not cgroups:
+    sys.exit("weft: give at least one --cgroup (e.g. user.slice/user-1000.slice/user@1000.service/app.slice)")
+net = ipaddress.ip_network(tun["cidr"])
+ip = ipaddress.ip_address(address.split("/")[0])
+if ip not in net:
+    sys.exit(f"weft: {address} is outside the tunnel network {net}")
+cfg = {"name": name, "endpoint": tun["endpoint"], "server_public_key": server_pub.strip(),
+       "address": f"{ip}/{net.prefixlen}", "cgroups": cgroups}
+if bypass:
+    cfg["bypass"] = bypass
+if on_failure:
+    cfg["on_failure"] = on_failure
+    if tun.get("server_address"):
+        cfg["server_address"] = tun["server_address"]  # what run probes to judge the tunnel's health
+print(json.dumps(cfg, indent=2))
+PY
+        ;;
+      help|*)
+        cat <<'TUNNEL'
+Usage: ./weft.sh tunnel <command>   (on a server applied with tunnel = true)
+
+  pubkey                      The server's WireGuard public key
+  peers                       Clients the server admits: NAME PUBKEY ADDRESS
+  client-config NAME ADDRESS --cgroup PATH [--cgroup PATH]... [--bypass IP_OR_CIDR]... [--on-failure closed|direct]
+                              Print a client config for tunnel/weft_tunnel.py (save it as root to
+                              /etc/weft/tunnel/NAME.json on the client). --on-failure: while the
+                              tunnel is down, refuse selected traffic (closed, the default) or send
+                              it the normal way (direct)
+  add-peer NAME PUBKEY ADDRESS
+                              Admit a client (its public key from 'weft-tunnel keygen')
+  remove-peer NAME            Drop a client
+  handshakes                  Last handshake time of each client
+
+On the client: tunnel/install-client.sh installs weft-tunnel and its service (see README, "Tunnel egress").
+TUNNEL
+        ;;
+    esac
     ;;
 
   ssh)
@@ -207,7 +312,12 @@ Usage: ./weft.sh <command> [terraform args...]
   init        Initialize Terraform by hand (setup does this for you)
   plan        Preview what will be created/changed
   apply       Create or update the server
-  destroy     Tear down the server
+  destroy     Tear down the server (refuses to release a static IP unless
+              WEFT_RELEASE_STATIC_IP=1)
+  rebuild     Replace only the server (fresh disk, current cloud-init); the
+              static IP and firewall stay
+  tunnel      Tunnel egress clients: pubkey|peers|client-config|add-peer|
+              remove-peer|handshakes (./weft.sh tunnel help)
   ssh         SSH into the server as ops
   ip          Print the server IP
   hosts       List provisioned servers across all workspaces (--json)

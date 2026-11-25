@@ -96,3 +96,69 @@ variable "bare_metal" {
   type        = bool
   default     = false
 }
+
+# --- Security ---
+
+variable "ssh_tcp_forwarding" {
+  description = "Let sshd forward TCP (ssh -L/-D). Off for a box nobody forwards through, such as a tunnel egress."
+  type        = bool
+  default     = true
+}
+
+variable "disable_ipv6" {
+  description = "Turn IPv6 off in the guest, so the server is reached and leaves only on its IPv4 address."
+  type        = bool
+  default     = true
+}
+
+variable "vultr_firewall" {
+  description = <<-EOT
+    Vultr only: put the server behind a Vultr firewall group, which drops traffic at Vultr's edge before it
+    reaches the guest. Allows SSH from ssh_allowed_cidrs and, with tunnel on, the tunnel's UDP port from anywhere.
+    Attaching one to a server that already runs is an in-place change, so it is off unless asked for.
+  EOT
+  type        = bool
+  default     = false
+}
+
+# --- Static IP ---
+
+variable "static_ip" {
+  description = <<-EOT
+    Give the server an address of its own that outlives it: a Vultr reserved IPv4 as its main address, or an AWS
+    Elastic IP. The reservation is its own resource, so the address survives the server being rebuilt
+    (`./weft.sh rebuild`); `./weft.sh destroy` releases it only when asked to. Use it when something outside (an API
+    key's IP allowlist) is tied to the address. Not for Vultr bare metal.
+  EOT
+  type        = bool
+  default     = false
+}
+
+# --- Tunnel egress ---
+
+variable "tunnel" {
+  description = <<-EOT
+    Make the server a WireGuard egress: clients set up with `./weft.sh tunnel` send chosen traffic through it,
+    and it leaves from the server's address. Tunnel clients reach only the public internet, never the server's
+    private networks or the cloud metadata service.
+  EOT
+  type        = bool
+  default     = false
+}
+
+variable "tunnel_port" {
+  description = "UDP port WireGuard listens on."
+  type        = number
+  default     = 51820
+}
+
+variable "tunnel_cidr" {
+  description = "Private /24 inside the tunnel. The server takes .1; clients take .2 upwards."
+  type        = string
+  default     = "10.77.0.0/24"
+
+  validation {
+    condition     = can(cidrhost(var.tunnel_cidr, 1)) && endswith(var.tunnel_cidr, "/24")
+    error_message = "tunnel_cidr must be an IPv4 /24, such as 10.77.0.0/24."
+  }
+}

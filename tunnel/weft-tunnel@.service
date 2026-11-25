@@ -1,0 +1,36 @@
+# weft-tunnel@NAME: send the cgroups named in /etc/weft/tunnel/NAME.json through a weft egress, and nothing else.
+# Installed by tunnel/install-client.sh. Stopping it closes the tunnel: the selected cgroups are refused, not leaked.
+[Unit]
+Description=weft tunnel %i (selected cgroups through the weft egress)
+Wants=network-online.target
+After=network-online.target nftables.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/weft-tunnel --config /etc/weft/tunnel/%i.json run
+Restart=always
+RestartSec=3
+TimeoutStopSec=20
+
+# It changes links, routes, rules and nftables and nothing else.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+AmbientCapabilities=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

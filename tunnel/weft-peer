@@ -1,0 +1,104 @@
+#!/bin/sh
+# weft-peer: manage the WireGuard clients of a weft tunnel egress (runs on the server, as root).
+#
+#   weft-peer pubkey                      the server's public key
+#   weft-peer list                        NAME PUBKEY ADDRESS, one client per line
+#   weft-peer add NAME PUBKEY ADDRESS     add or replace client NAME at ADDRESS (an address in the tunnel /24)
+#   weft-peer remove NAME                 drop client NAME
+#
+# Clients live in /etc/wireguard/wg0.conf, one [Peer] block each, headed '# weft-peer NAME'. A change is applied to
+# the running interface peer by peer, so other clients' sessions are untouched.
+set -eu
+
+WG_DIR="${WEFT_WG_DIR:-/etc/wireguard}"  # overridable for tests only
+CONF="$WG_DIR/wg0.conf"
+IFACE=wg0
+
+die() { echo "weft-peer: $*" >&2; exit 1; }
+
+[ "$(id -u)" -eq 0 ] || die "run as root (sudo weft-peer ...)"
+[ -f "$CONF" ] || die "$CONF is missing: this server is not a tunnel egress"
+
+# The tunnel's /24 prefix ("10.77.0.") and the server's own last octet, from the Address line.
+server_address() { sed -n 's/^Address *= *\([0-9.]*\)\/24 *$/\1/p' "$CONF" | head -n 1; }
+
+valid_name() { printf '%s' "$1" | grep -Eq '^[a-z0-9][a-z0-9-]{0,31}$'; }
+valid_key() { printf '%s' "$1" | grep -Eq '^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw480]=$'; }
+
+# Print the conf without NAME's block (a block runs from its '# weft-peer NAME' line to the next blank line).
+without() {
+  awk -v want="# weft-peer $1" '
+    $0 == want { skip = 1; next }
+    skip && /^[[:space:]]*$/ { skip = 0; next }
+    !skip { print }
+  ' "$CONF"
+}
+
+# Write the new conf (stdin). The running interface is changed peer by peer with `wg set` (see live_*): `wg syncconf`
+# from a stripped conf would also clear the private key, which wg0.conf leaves to PostUp.
+write_conf() {
+  tmp="$(mktemp "$CONF.XXXXXX")"
+  cat > "$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$CONF"
+}
+
+running() { ip link show "$IFACE" >/dev/null 2>&1; }
+live_set() { if running; then wg set "$IFACE" peer "$1" allowed-ips "$2/32"; fi; }
+live_remove() { if running && [ -n "$1" ]; then wg set "$IFACE" peer "$1" remove; fi; }
+
+list() {
+  awk '
+    /^# weft-peer / { name = $3 }
+    name && /^PublicKey/ { key = $3 }
+    name && /^AllowedIPs/ { sub(/\/32$/, "", $3); print name, key, $3; name = ""; key = "" }
+  ' "$CONF"
+}
+
+cmd="${1:-}"
+case "$cmd" in
+  pubkey)
+    cat "$WG_DIR/server.pub"
+    ;;
+  list)
+    list
+    ;;
+  add)
+    [ $# -eq 4 ] || die "usage: weft-peer add NAME PUBKEY ADDRESS"
+    name="$2"; key="$3"; addr="$4"
+    valid_name "$name" || die "name '$name': use 1-32 lowercase letters, digits and dashes"
+    valid_key "$key" || die "'$key' is not a WireGuard public key"
+    server="$(server_address)"
+    [ -n "$server" ] || die "no 'Address = a.b.c.d/24' line in $CONF"
+    prefix="${server%.*}."
+    case "$addr" in "$prefix"*) ;; *) die "$addr is outside the tunnel's ${prefix}0/24" ;; esac
+    last="${addr#"$prefix"}"
+    printf '%s' "$last" | grep -Eq '^(0|[1-9][0-9]{0,2})$' || die "$addr is not an IPv4 address"
+    [ "$last" -ge 2 ] && [ "$last" -le 254 ] || die "$addr: clients take .2 to .254"
+    [ "$addr" != "$server" ] || die "$addr is the server's own address"
+    # Another client already holding the address or the key would make WireGuard route to the wrong one.
+    clash="$(list | awk -v n="$name" -v k="$key" -v a="$addr" '
+      $1 != n && $3 == a { print a " already belongs to client \047" $1 "\047"; exit }
+      $1 != n && $2 == k { print "that key already belongs to client \047" $1 "\047"; exit }')"
+    [ -z "$clash" ] || die "$clash"
+    old_key="$(list | awk -v n="$name" '$1 == n { print $2 }')"
+    { without "$name"; printf '\n# weft-peer %s\n[Peer]\nPublicKey = %s\nAllowedIPs = %s/32\n\n' "$name" "$key" "$addr"; } \
+      | cat -s | write_conf
+    [ "$old_key" = "$key" ] || live_remove "$old_key"
+    live_set "$key" "$addr"
+    echo "weft-peer: $name at $addr"
+    ;;
+  remove)
+    [ $# -eq 2 ] || die "usage: weft-peer remove NAME"
+    valid_name "$2" || die "name '$2': use 1-32 lowercase letters, digits and dashes"
+    list | awk -v n="$2" '$1 == n { found = 1 } END { exit !found }' || die "no client called '$2'"
+    old_key="$(list | awk -v n="$2" '$1 == n { print $2 }')"
+    without "$2" | cat -s | write_conf
+    live_remove "$old_key"
+    echo "weft-peer: removed $2"
+    ;;
+  *)
+    sed -n '2,8s/^# \{0,1\}//p' "$0"
+    exit 2
+    ;;
+esac

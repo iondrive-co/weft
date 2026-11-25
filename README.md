@@ -88,7 +88,9 @@ All commands go through `./weft.sh`:
 | `./weft.sh setup`      | Run the setup wizard (safe to re-run)    |
 | `./weft.sh plan`       | Preview what will be created             |
 | `./weft.sh apply`      | Create or update the server              |
-| `./weft.sh destroy`    | Tear down the server                     |
+| `./weft.sh destroy`    | Tear down the server (refuses to release a static IP unless `WEFT_RELEASE_STATIC_IP=1`) |
+| `./weft.sh rebuild`    | Replace only the server: fresh disk and current cloud-init, same static IP |
+| `./weft.sh tunnel`     | Tunnel egress clients (`pubkey\|peers\|client-config\|add-peer\|remove-peer\|handshakes`) |
 | `./weft.sh ssh`        | SSH into the server as `ops`             |
 | `./weft.sh ip`         | Print the server's IP address            |
 | `./weft.sh hosts`      | List provisioned servers across workspaces (`--json`) |
@@ -194,6 +196,13 @@ hostname = "bigserver"
 | `aws_architecture`    | `amd64`                | AWS only; `arm64` for Graviton (`t4g.*`) types     |
 | `aws_root_volume_gb`  | `20`                   | AWS only; encrypted gp3 root volume                |
 | `aws_subnet_id`       | null                   | AWS only; defaults to the default VPC's subnet     |
+| `ssh_tcp_forwarding`  | `true`                 | `false` turns off SSH TCP forwarding (`ssh -L/-D`)  |
+| `disable_ipv6`        | `true`                 | IPv6 off on the server (sysctl and UFW); `false` keeps it |
+| `vultr_firewall`      | `false`                | Vultr only; a firewall group at Vultr's edge: SSH from `ssh_allowed_cidrs`, the tunnel port |
+| `static_ip`           | `false`                | A Vultr reserved IP or AWS Elastic IP that survives rebuilds |
+| `tunnel`              | `false`                | Make the server a WireGuard tunnel egress (see below) |
+| `tunnel_port`         | `51820`                | Tunnel UDP port                                     |
+| `tunnel_cidr`         | `10.77.0.0/24`         | Tunnel network (a /24; the server is .1)            |
 
 ### Available regions
 
@@ -252,9 +261,16 @@ Common ones:
 Cloud-init runs on first boot and configures:
 
 - **ops user**: sudo (NOPASSWD), your SSH key, bash shell
-- **SSH hardening**: password auth off, root login off, X11 forwarding off
-- **Firewall (UFW)**: deny all incoming, allow SSH (22/tcp) only, narrowed to
-  `ssh_allowed_cidrs` if you set it
+- **SSH hardening**: keys only, `ops` only, root login off, X11/agent/socket
+  forwarding and tunnels off (TCP forwarding too with `ssh_tcp_forwarding = false`),
+  3 auth tries, short login grace, modern key exchange/ciphers/MACs only (dropped
+  again if that sshd cannot parse them, so a box never ends up without sshd)
+- **Kernel hardening**: no redirects or source routes, strict reverse-path
+  filtering, martians logged, SYN cookies, kernel pointers/dmesg/BPF/ptrace
+  restricted, protected links and FIFOs; IPv6 off unless `disable_ipv6 = false`
+- **Firewall (UFW)**: deny all incoming and routed, allow SSH (22/tcp, rate
+  limited) only, narrowed to `ssh_allowed_cidrs` if you set it; on Vultr a
+  firewall group at the edge as well with `vultr_firewall = true`
 - **Unattended upgrades**: disabled (masked, purged, and pinned)
 - **APT mirror**: a nearby cloud mirror on Vultr (reverting to the default if it
   doesn't respond); left alone on AWS, where the AMI already has a regional one
@@ -325,6 +341,83 @@ PyCharm, they appear in the Run dropdown:
 - **Weft: Destroy** -- tear down server
 
 
+## Static IP and tunnel egress
+
+For when an address is what something else trusts (an API key's IP
+allowlist, a partner's firewall), and only some programs on a machine should
+use it.
+
+```hcl
+# workspaces/egress.tfvars
+static_ip      = true   # Vultr reserved IP / AWS Elastic IP: survives rebuilds
+tunnel         = true   # WireGuard egress on the server
+vultr_firewall = true   # Vultr edge firewall (SSH from ssh_allowed_cidrs, tunnel port)
+```
+
+`./weft.sh ip` and `terraform output static_ip` give the address to put on the
+allowlists. `./weft.sh rebuild` gives you a fresh server on the same address;
+`./weft.sh destroy` refuses while a static IP is held, because a released IP
+is gone for good (`WEFT_RELEASE_STATIC_IP=1 ./weft.sh destroy` if you mean it).
+A rebuilt tunnel server has a new WireGuard key and no peers: run
+`client-config` and `add-peer` again.
+
+**The server** (`tunnel = true`) runs WireGuard on `wg0` (`tunnel_port`/udp,
+server key made on the box, never leaving it) and forwards tunnel clients to
+the public internet only: not to private, shared or link-local space (so not
+the cloud metadata service), not to each other, no IPv6. They leave
+masqueraded as the server's address. `weft-peer` on the box (`sudo weft-peer
+list|add|remove`) admits clients one by one without touching the others.
+
+**The client** (`tunnel/weft_tunnel.py`, installed as `weft-tunnel`) sends the
+sockets of chosen cgroups, usually a systemd slice, through the tunnel and
+leaves every other process on the machine on its normal route. It is never a
+default route and no VPN in the usual sense:
+
+- an nftables route chain marks packets from sockets in the chosen cgroups
+  (`socket cgroupv2`), and an ip rule sends marked packets, and packets from
+  sockets bound to the tunnel address, to a routing table of its own;
+- local and private destinations and any `bypass` addresses stay on the normal
+  route, even from the chosen cgroups;
+- only new connections are steered: a connection that exists keeps the route
+  it started on when the tunnel comes up or goes down;
+- with the tunnel down it fails closed by default: the chosen processes are
+  refused at once (TCP reset / unreachable) rather than sent the normal way.
+  With `"on_failure": "direct"` (`client-config --on-failure direct`) they
+  go the normal way instead, for programs that must keep working without the
+  fixed address (services that do not check it). The service then probes the
+  server through the tunnel (an ICMP echo to `server_address`, every 2 s):
+  it starts direct, enters the tunnel once the server answers, and leaves
+  it after `fail_after` (3) failed probes in a row, refusing the tunnel's
+  live connections so their programs reconnect the normal way at once.
+  `status` reports `mode` (`open`, `closed` or `direct`) and `probe`;
+- the service (`weft-tunnel@NAME`) puts back whatever disappears (interface,
+  rules, table after a firewall reload) and picks up a cgroup that appears
+  later. Stopping it closes the tunnel; `install-client.sh --remove NAME` takes
+  everything away. DNS is not tunnelled: lookups use the machine's resolver.
+
+Setting up a client (from this checkout, on the client machine):
+
+```bash
+# 1. A config: which cgroups, which tunnel address (.2-.254 of tunnel_cidr)
+./weft.sh tunnel client-config box 10.77.0.2 \
+    --cgroup user.slice/user-1000.slice/user@1000.service/app.slice \
+    --bypass 198.51.100.10 > box.json        # add --on-failure direct to fall back
+# 2. Install weft-tunnel, its service and the config; it prints the client's public key
+pkexec tunnel/install-client.sh box.json        # or sudo
+# 3. Admit the client on the server
+./weft.sh tunnel add-peer box CLIENT_PUBLIC_KEY 10.77.0.2
+# 4. Start it
+pkexec systemctl enable --now weft-tunnel@box.service
+pkexec weft-tunnel --config /etc/weft/tunnel/box.json status
+```
+
+Put programs in the slice with `Slice=app.slice` in their units, or
+`weft-tunnel --config /etc/weft/tunnel/box.json exec -- CMD` for a one-off.
+A program can also opt in per socket by binding to the tunnel address.
+SSH to the server works over the tunnel too: `ssh -b 10.77.0.2 ops@10.77.0.1`,
+which keeps working when the client's public address leaves `ssh_allowed_cidrs`.
+
+
 ## Tearing down
 
 ```bash
@@ -332,7 +425,8 @@ PyCharm, they appear in the Run dropdown:
 ```
 
 Type `yes` when prompted. This destroys the server, plus the SSH key (and, on
-AWS, the security group). Billing stops immediately on Vultr; on AWS the
+AWS, the security group). A workspace holding a static IP is refused (see
+above); `./weft.sh rebuild` replaces the server and keeps the IP. Billing stops immediately on Vultr; on AWS the
 instance and its EBS volume are both deleted.
 
 

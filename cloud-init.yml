@@ -29,17 +29,120 @@ ntp:
 %{ endif ~}
 
 write_files:
-  - path: /etc/ssh/sshd_config.d/99-hardening.conf
+  # sshd keeps the first value it reads for each keyword and reads sshd_config.d in name order, so weft's files start
+  # with 0 to come before anything the image ships (50-cloud-init.conf and the like).
+  - path: /etc/ssh/sshd_config.d/01-weft-hardening.conf
     content: |
       PasswordAuthentication no
       KbdInteractiveAuthentication no
+      PermitEmptyPasswords no
+      PubkeyAuthentication yes
+      AuthenticationMethods publickey
       PermitRootLogin no
+      AllowUsers ops
+      MaxAuthTries 3
+      MaxSessions 6
+      LoginGraceTime 20
+      MaxStartups 10:30:60
+      ClientAliveInterval 300
+      ClientAliveCountMax 2
+      PermitUserEnvironment no
       X11Forwarding no
       AllowAgentForwarding no
+      AllowTcpForwarding ${ssh_forwarding ? "yes" : "no"}
+      AllowStreamLocalForwarding no
+      GatewayPorts no
+      PermitTunnel no
+
+  # Modern key exchange, ciphers and MACs only. runcmd drops this file again if this sshd does not know one of them,
+  # so a newer list can never leave the box without sshd.
+  - path: /etc/ssh/sshd_config.d/02-weft-ciphers.conf
+    content: |
+      KexAlgorithms sntrup761x25519-sha512@openssh.com,curve25519-sha256,curve25519-sha256@libssh.org
+      Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com
+      MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com
 
   - path: /etc/sysctl.d/99-swap.conf
     content: |
       vm.swappiness=1
+
+  - path: /etc/sysctl.d/98-weft-hardening.conf
+    content: |
+      # No redirects or source routes, strict reverse-path checks, logged martians
+      net.ipv4.conf.all.accept_redirects=0
+      net.ipv4.conf.default.accept_redirects=0
+      net.ipv4.conf.all.secure_redirects=0
+      net.ipv4.conf.default.secure_redirects=0
+      net.ipv4.conf.all.send_redirects=0
+      net.ipv4.conf.default.send_redirects=0
+      net.ipv4.conf.all.accept_source_route=0
+      net.ipv4.conf.default.accept_source_route=0
+      net.ipv4.conf.all.rp_filter=1
+      net.ipv4.conf.default.rp_filter=1
+      net.ipv4.conf.all.log_martians=1
+      net.ipv4.conf.default.log_martians=1
+      net.ipv4.icmp_echo_ignore_broadcasts=1
+      net.ipv4.icmp_ignore_bogus_error_responses=1
+      net.ipv4.tcp_syncookies=1
+      net.ipv4.tcp_rfc1337=1
+      # Kernel pointers, logs, BPF and ptrace out of reach of unprivileged code
+      kernel.kptr_restrict=2
+      kernel.dmesg_restrict=1
+      kernel.unprivileged_bpf_disabled=1
+      net.core.bpf_jit_harden=2
+      kernel.yama.ptrace_scope=1
+      kernel.sysrq=0
+      fs.suid_dumpable=0
+      fs.protected_hardlinks=1
+      fs.protected_symlinks=1
+      fs.protected_fifos=2
+      fs.protected_regular=2
+%{ if tunnel ~}
+      # Tunnel egress: forward tunnel clients' IPv4 out (weft-egress.nft decides what may be forwarded)
+      net.ipv4.ip_forward=1
+%{ endif ~}
+%{ if disable_ipv6 ~}
+
+  - path: /etc/sysctl.d/98-weft-noipv6.conf
+    content: |
+      net.ipv6.conf.all.disable_ipv6=1
+      net.ipv6.conf.default.disable_ipv6=1
+%{ endif ~}
+%{ if tunnel ~}
+
+  - path: /usr/local/sbin/weft-peer
+    permissions: '0755'
+    content: |
+      ${indent(6, weft_peer)}
+
+  # Tunnel clients reach the public internet and nothing else: not the cloud metadata service, not private or
+  # shared address space, not each other. Their traffic leaves masqueraded as the server's address.
+  - path: /etc/weft/egress.nft
+    content: |
+      ${indent(6, egress_nft)}
+
+  - path: /etc/systemd/system/weft-egress.service
+    content: |
+      [Unit]
+      Description=weft: tunnel egress filter and NAT (/etc/weft/egress.nft)
+      Before=wg-quick@wg0.service
+      After=network-pre.target
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/usr/sbin/nft -f /etc/weft/egress.nft
+      ExecStop=/usr/sbin/nft delete table inet weft_egress
+
+      [Install]
+      WantedBy=multi-user.target
+
+  - path: /etc/systemd/system/wg-quick@wg0.service.d/10-weft.conf
+    content: |
+      [Unit]
+      Requires=weft-egress.service
+      After=weft-egress.service
+%{ endif ~}
 
   - path: /etc/apt/apt.conf.d/99-no-unattended
     content: |
@@ -81,23 +184,54 @@ runcmd:
 
   # Install base packages
   - apt-get install -y curl git jq ufw net-tools rsync unzip ca-certificates vim-tiny dnsutils ncdu lsof tcpdump atop
+%{ if tunnel ~}
+  - apt-get install -y wireguard-tools nftables
+%{ endif ~}
 
   # Configure UFW
+%{ if disable_ipv6 ~}
+  - sed -i 's/^IPV6=.*/IPV6=no/' /etc/default/ufw
+%{ endif ~}
   - ufw default deny incoming
   - ufw default allow outgoing
+  - ufw default deny routed
 %{ if length(ssh_allowed_cidrs) == 0 || contains(ssh_allowed_cidrs, "0.0.0.0/0") ~}
-  - ufw allow 22/tcp
+  - ufw limit 22/tcp
 %{ else ~}
 %{ for cidr in ssh_allowed_cidrs ~}
-  - ufw allow from ${cidr} to any port 22 proto tcp
+  - ufw limit from ${cidr} to any port 22 proto tcp
 %{ endfor ~}
   # Vultr's Ubuntu image ships with 22/tcp open to all, which the rules above only add to
   - ufw delete allow 22/tcp || true
 %{ endif ~}
+%{ if tunnel ~}
+  # The tunnel: its UDP port from anywhere, SSH from inside it, and tunnel clients routed out the public interface
+  - ufw allow ${tunnel_port}/udp
+  - ufw allow in on wg0 to any port 22 proto tcp
+  - ufw route allow in on wg0 out on "$(ip -o -4 route show default | awk '{print $5; exit}')"
+%{ endif ~}
   - ufw --force enable
 
-  # Apply sysctl
-  - sysctl -p /etc/sysctl.d/99-swap.conf
+  # Apply sysctl (hardening, swap, and IPv6 off when asked)
+  - sysctl --system
+%{ if tunnel ~}
+
+  # WireGuard server. Its private key is made here and never leaves the box; `./weft.sh tunnel` reads the public
+  # half over SSH and adds client peers with weft-peer.
+  - |
+    set -e
+    umask 077
+    mkdir -p /etc/wireguard
+    [ -s /etc/wireguard/server.key ] || wg genkey > /etc/wireguard/server.key
+    wg pubkey < /etc/wireguard/server.key > /etc/wireguard/server.pub
+    chmod 644 /etc/wireguard/server.pub
+    if [ ! -f /etc/wireguard/wg0.conf ]; then
+      printf '%s\n' '[Interface]' 'Address = ${tunnel_address}' 'ListenPort = ${tunnel_port}' \
+        'PostUp = wg set %i private-key /etc/wireguard/server.key' > /etc/wireguard/wg0.conf
+    fi
+    systemctl daemon-reload
+    systemctl enable --now weft-egress.service wg-quick@wg0.service
+%{ endif ~}
 
   # Ensure ops user has SSH key (belt-and-suspenders, some providers
   # don't reliably process ssh_authorized_keys in the users block)
@@ -111,5 +245,11 @@ runcmd:
   # Remove root SSH access
   - rm -f /root/.ssh/authorized_keys
 
-  # Restart sshd to apply hardening
-  - systemctl restart sshd
+  # Restart sshd to apply hardening; a cipher list this sshd cannot parse is dropped rather than locking us out
+  - mkdir -p /run/sshd
+  - |
+    if ! sshd -t; then
+      echo "weft: dropping 02-weft-ciphers.conf, sshd -t refused it"
+      rm -f /etc/ssh/sshd_config.d/02-weft-ciphers.conf
+    fi
+    sshd -t && systemctl restart sshd

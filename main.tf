@@ -36,5 +36,13 @@ locals {
     ntp_servers       = local.ntp_servers
     ssh_allowed_cidrs = var.ssh_allowed_cidrs
     timezone          = var.timezone
+    ssh_forwarding    = var.ssh_tcp_forwarding
+    disable_ipv6      = var.disable_ipv6
+    tunnel            = var.tunnel
+    tunnel_port       = var.tunnel_port
+    tunnel_cidr       = var.tunnel_cidr
+    tunnel_address    = "${cidrhost(var.tunnel_cidr, 1)}/24"
+    weft_peer         = file("${path.module}/tunnel/weft-peer")
+    egress_nft        = templatefile("${path.module}/tunnel/egress.nft.tftpl", { tunnel_cidr = var.tunnel_cidr })
   })
 }
