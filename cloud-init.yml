@@ -19,16 +19,29 @@ locale: en_US.UTF-8
 
 timezone: ${timezone}
 
+%{ if is_vultr ~}
+# Run package updates in Weft's boot script, after selecting the mirror.
+package_update: false
+package_upgrade: false
+
+%{ endif ~}
 ntp:
   enabled: true
-%{ if length(ntp_servers) > 0 ~}
   servers:
 %{ for server in ntp_servers ~}
     - ${server}
 %{ endfor ~}
-%{ endif ~}
 
 write_files:
+%{ if is_vultr ~}
+  # Clear earlier system-wide sources on images where cloud-init selects timesyncd.
+  - path: /etc/systemd/timesyncd.conf.d/zz-weft-ntp.conf
+    content: |
+      [Time]
+      NTP=
+      NTP=${join(" ", ntp_servers)}
+
+%{ endif ~}
   # sshd keeps the first value it reads for each keyword and reads sshd_config.d in name order, so weft's files start
   # with 0 to come before anything the image ships (50-cloud-init.conf and the like).
   - path: /etc/ssh/sshd_config.d/01-weft-hardening.conf
@@ -156,6 +169,7 @@ write_files:
       Pin-Priority: -1
 
 runcmd:
+  - setup_status=0
   - systemctl mask unattended-upgrades.service
   - apt-get remove -y unattended-upgrades || true
 
@@ -165,27 +179,32 @@ runcmd:
   - |
     mirror='${apt_mirror}'
     files='/etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list'
+    apt_updated=true
     if [ -n "$mirror" ]; then
       for f in $files; do
         if [ -f "$f" ]; then
           sed -i.weft-bak "s|http://archive.ubuntu.com/ubuntu|$mirror|g" "$f"
         fi
       done
-      if ! apt-get update; then
+      if ! apt-get -o APT::Update::Error-Mode=any update; then
         echo "weft: APT mirror $mirror failed, reverting to the image default"
         for f in $files; do
           if [ -f "$f.weft-bak" ]; then mv "$f.weft-bak" "$f"; fi
         done
-        apt-get update
+        apt-get -o APT::Update::Error-Mode=any update || apt_updated=false
       fi
     else
-      apt-get update
+      apt-get -o APT::Update::Error-Mode=any update || apt_updated=false
+    fi
+    if [ "$apt_updated" = false ]; then
+      echo 'weft: APT refresh failed, trying package installs with cached indexes' >&2
+      setup_status=1
     fi
 
   # Install base packages
-  - apt-get install -y curl git jq ufw net-tools rsync unzip ca-certificates vim-tiny dnsutils ncdu lsof tcpdump atop
+  - apt-get install -y curl git jq ufw net-tools rsync unzip ca-certificates vim-tiny dnsutils ncdu lsof tcpdump atop || setup_status=1
 %{ if tunnel ~}
-  - apt-get install -y wireguard-tools nftables
+  - apt-get install -y wireguard-tools nftables || setup_status=1
 %{ endif ~}
 
   # Configure UFW
@@ -210,40 +229,25 @@ runcmd:
   - ufw allow in on wg0 to any port 22 proto tcp
   - ufw route allow in on wg0 out on "$(ip -o -4 route show default | awk '{print $5; exit}')"
 %{ endif ~}
-  - ufw --force enable
+  - ufw --force enable || setup_status=1
 
   # Apply sysctl (hardening, swap, and IPv6 off when asked)
-  - sysctl --system
-%{ if tunnel ~}
-
-  # WireGuard server. Its private key is made here and never leaves the box; `./weft.sh tunnel` reads the public
-  # half over SSH and adds client peers with weft-peer.
-  - |
-    set -e
-    umask 077
-    mkdir -p /etc/wireguard
-    [ -s /etc/wireguard/server.key ] || wg genkey > /etc/wireguard/server.key
-    wg pubkey < /etc/wireguard/server.key > /etc/wireguard/server.pub
-    chmod 644 /etc/wireguard/server.pub
-    if [ ! -f /etc/wireguard/wg0.conf ]; then
-      printf '%s\n' '[Interface]' 'Address = ${tunnel_address}' 'ListenPort = ${tunnel_port}' \
-        'PostUp = wg set %i private-key /etc/wireguard/server.key' > /etc/wireguard/wg0.conf
-    fi
-    systemctl daemon-reload
-    systemctl enable --now weft-egress.service wg-quick@wg0.service
-%{ endif ~}
+  - sysctl --system || setup_status=1
 
   # Ensure ops user has SSH key (belt-and-suspenders, some providers
   # don't reliably process ssh_authorized_keys in the users block)
-  - mkdir -p /home/ops/.ssh
-  - echo '${ssh_public_key}' >> /home/ops/.ssh/authorized_keys
-  - sort -u -o /home/ops/.ssh/authorized_keys /home/ops/.ssh/authorized_keys
-  - chmod 700 /home/ops/.ssh
-  - chmod 600 /home/ops/.ssh/authorized_keys
-  - chown -R ops:ops /home/ops/.ssh
+  - |
+    ssh_dir=/home/ops/.ssh
+    keys="$ssh_dir/authorized_keys"
+    mkdir -p "$ssh_dir" &&
+      echo '${ssh_public_key}' >> "$keys" &&
+      sort -u -o "$keys" "$keys" &&
+      chmod 700 "$ssh_dir" &&
+      chmod 600 "$keys" &&
+      chown -R ops:ops "$ssh_dir" || setup_status=1
 
   # Remove root SSH access
-  - rm -f /root/.ssh/authorized_keys
+  - rm -f /root/.ssh/authorized_keys || setup_status=1
 
   # Restart sshd to apply hardening; a cipher list this sshd cannot parse is dropped rather than locking us out
   - mkdir -p /run/sshd
@@ -252,4 +256,31 @@ runcmd:
       echo "weft: dropping 02-weft-ciphers.conf, sshd -t refused it"
       rm -f /etc/ssh/sshd_config.d/02-weft-ciphers.conf
     fi
-    sshd -t && systemctl restart sshd
+    sshd -t && systemctl restart sshd || setup_status=1
+%{ if tunnel ~}
+
+  # Create the WireGuard key locally. `./weft.sh tunnel` reads its public half over SSH.
+  - |
+    (
+      set -e
+      umask 077
+      mkdir -p /etc/wireguard
+      [ -s /etc/wireguard/server.key ] || wg genkey > /etc/wireguard/server.key
+      wg pubkey < /etc/wireguard/server.key > /etc/wireguard/server.pub
+      chmod 644 /etc/wireguard/server.pub
+      if [ ! -f /etc/wireguard/wg0.conf ]; then
+        printf '%s\n' '[Interface]' 'Address = ${tunnel_address}' 'ListenPort = ${tunnel_port}' \
+          'PostUp = wg set %i private-key /etc/wireguard/server.key' > /etc/wireguard/wg0.conf
+      fi
+      systemctl daemon-reload
+      systemctl enable --now weft-egress.service wg-quick@wg0.service
+    )
+    [ "$?" -eq 0 ] || setup_status=1
+%{ endif ~}
+
+  # Upgrade after runtime setup, using freshly downloaded indexes.
+  - |
+    if [ "$apt_updated" = true ]; then
+      DEBIAN_FRONTEND=noninteractive apt-get -y --no-remove -o Dpkg::Options::=--force-confold upgrade --with-new-pkgs || setup_status=1
+    fi
+    exit "$setup_status"

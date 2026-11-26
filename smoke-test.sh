@@ -127,7 +127,7 @@ check() {
   fi
 }
 
-check "cloud-init finished cleanly"   "sudo cloud-init status | grep -q 'status: done'"
+check "cloud-init finished cleanly"   'status=$(sudo cloud-init status) && grep -qx "status: done" <<< "$status"'
 check "hostname is ${want_hostname}"  "[ \"\$(hostname)\" = '${want_hostname}' ]"
 check "logged in as ops"              "[ \"\$(whoami)\" = ops ]"
 check "passwordless sudo"             "sudo -n true"
@@ -160,9 +160,26 @@ check "ntp enabled"                   "timedatectl show -p NTP --value | grep -q
 check "swappiness is 1"               "[ \"\$(cat /proc/sys/vm/swappiness)\" = 1 ]"
 check "unattended-upgrades masked"    "[ \"\$(systemctl is-enabled unattended-upgrades.service 2>&1)\" = masked ]"
 check "unattended-upgrades removed"   "! dpkg -s unattended-upgrades 2>/dev/null | grep -q 'Status: install ok installed'"
-check "apt update works"              "sudo apt-get -qq update"
+check "apt update works"              "sudo apt-get -qq -o APT::Update::Error-Mode=any update"
 
 if [ "$cloud" = "vultr" ]; then
+  vultr_time_sync() {
+    local attempt source
+    for ((attempt=0; attempt<12; attempt++)); do
+      source=
+      if systemctl is-active --quiet chrony.service; then
+        source=$(chronyc -N sources | awk '$1 == "^*" {print $2}')
+      elif [ "$(timedatectl show -p NTPSynchronized --value)" = yes ]; then
+        source=$(timedatectl show-timesync -p ServerName --value)
+      fi
+      case "$source" in
+        time.cloudflare.com|0.ubuntu.pool.ntp.org|1.ubuntu.pool.ntp.org) return 0 ;;
+      esac
+      sleep 5
+    done
+    return 1
+  }
+  check "clock synced to a configured Vultr NTP source" vultr_time_sync
   # Older Vultr images used the generic archive.ubuntu.com, which weft rewrites to the cloud mirror; newer ones ship
   # Vultr's own mirror. Either way, not the generic archive.
   check "apt uses a nearby mirror"    "! grep -rsqE --include='*.sources' --include='*.list' '//(us\\.)?archive\\.ubuntu\\.com' /etc/apt/sources.list.d/ /etc/apt/sources.list"
