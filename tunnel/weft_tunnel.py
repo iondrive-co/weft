@@ -493,6 +493,9 @@ def cmd_status(cfg: dict) -> dict:
     return out
 
 
+RUN_GIVE_UP = 3  # run: failed checks in a row before the loop exits (and systemd restarts it)
+
+
 class _Stop(Exception):
     pass
 
@@ -513,23 +516,34 @@ def cmd_run(cfg: dict, interval: float) -> None:
     try:
         print(json.dumps(cmd_up(cfg, mode)), flush=True)
         ids = cgroup_ids(cfg)
+        errors = 0
         while True:
             time.sleep(interval)
-            made = ensure_policy(cfg)
-            if ensure_iface(cfg):
-                made.append("interface")
-            switched = None
-            if watch:
-                healthy = probe(cfg, timeout=min(2.0, max(interval, 0.5)))
-                fails = 0 if healthy else fails + 1
-                if mode == "direct" and healthy:
-                    mode, switched = "open", "the server answers through the tunnel"
-                elif mode == "open" and fails >= cfg["fail_after"]:
-                    mode, switched = "direct", f"{fails} probes in a row failed"
-            now = cgroup_ids(cfg)
-            if ensure_nft(cfg, now, force=now != ids or switched is not None, mode=mode) and not switched:
-                made.append("nft table")
-            ids = now
+            try:
+                made = ensure_policy(cfg)
+                if ensure_iface(cfg):
+                    made.append("interface")
+                switched = None
+                if watch:
+                    healthy = probe(cfg, timeout=min(2.0, max(interval, 0.5)))
+                    fails = 0 if healthy else fails + 1
+                    if mode == "direct" and healthy:
+                        mode, switched = "open", "the server answers through the tunnel"
+                    elif mode == "open" and fails >= cfg["fail_after"]:
+                        mode, switched = "direct", f"{fails} probes in a row failed"
+                now = cgroup_ids(cfg)
+                if ensure_nft(cfg, now, force=now != ids or switched is not None, mode=mode) and not switched:
+                    made.append("nft table")
+                ids = now
+            except (SystemExit, OSError) as exc:
+                # One bad tick (the interface deleted between the check and `wg set`) is retried on the next; only
+                # RUN_GIVE_UP in a row end the loop, so a lasting fault still exits and the service restarts it.
+                errors += 1
+                print(json.dumps({"error": str(exc), "in_a_row": errors}), flush=True)
+                if errors >= RUN_GIVE_UP:
+                    raise
+                continue
+            errors = 0
             if switched:
                 print(json.dumps({"mode": mode, "why": switched}), flush=True)
             if made:

@@ -490,6 +490,70 @@ def test_install_client_refuses_to_run_unprivileged(installer):
     assert calls == [] and not (installer.root / "etc/weft").exists()
 
 
+# --- run loop ------------------------------------------------------------------------------------------------------
+
+@pytest.fixture
+def loop(monkeypatch):
+    """cmd_run with every system call faked: `loop.ticks` lists what ensure_iface does per tick (True/False, or an
+    exception to raise); after the list runs out the next tick stops the loop as SIGTERM would."""
+    class Loop:
+        ticks: list = []
+        downs = 0
+
+        def run(self, capsys):
+            wt.cmd_run({"on_failure": "open", "fail_after": 2}, interval=0)
+            return [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+
+    lp = Loop()
+
+    def iface(_cfg):
+        if not lp.ticks:
+            raise wt._Stop("SIGTERM")
+        step = lp.ticks.pop(0)
+        if isinstance(step, BaseException):
+            raise step
+        return step
+
+    def down(_cfg):
+        lp.downs += 1
+
+    monkeypatch.setattr(wt.signal, "signal", lambda *_a: None)
+    monkeypatch.setattr(wt.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(wt, "cmd_up", lambda _cfg, mode: {"made": [], "mode": mode})
+    monkeypatch.setattr(wt, "cmd_down", down)
+    monkeypatch.setattr(wt, "down_mode", lambda _cfg: "closed")
+    monkeypatch.setattr(wt, "cgroup_ids", lambda _cfg: {"a.slice": 1})
+    monkeypatch.setattr(wt, "ensure_policy", lambda _cfg: [])
+    monkeypatch.setattr(wt, "ensure_iface", iface)
+    monkeypatch.setattr(wt, "ensure_nft", lambda *_a, **_k: False)
+    return lp
+
+
+def test_run_survives_a_check_that_fails_once_and_restores_on_the_next(loop, capsys):
+    gone = SystemExit('weft-tunnel: ip link set weft-t mtu 1420 up failed: Cannot find device "weft-t"')
+    loop.ticks = [gone, True]
+    lines = loop.run(capsys)
+    assert lines[1] == {"error": str(gone), "in_a_row": 1}
+    assert lines[2]["restored"] == ["interface"]
+    assert lines[-1]["stopped"] == "SIGTERM" and loop.downs == 1
+
+
+def test_run_counts_only_failures_in_a_row(loop, capsys):
+    loop.ticks = [OSError("x"), OSError("x"), False] * 2 + [OSError("x"), OSError("x")]
+    lines = loop.run(capsys)
+    assert [ln["in_a_row"] for ln in lines if "error" in ln] == [1, 2, 1, 2, 1, 2]
+    assert lines[-1]["stopped"] == "SIGTERM"
+
+
+def test_run_exits_on_a_lasting_fault_without_closing_the_tunnel(loop, capsys):
+    loop.ticks = [SystemExit("weft-tunnel: no private key at /k; run keygen first")] * wt.RUN_GIVE_UP + [True]
+    with pytest.raises(SystemExit, match="no private key"):
+        loop.run(capsys)
+    errors = [json.loads(line) for line in capsys.readouterr().out.splitlines() if "error" in line]
+    assert [e["in_a_row"] for e in errors] == list(range(1, wt.RUN_GIVE_UP + 1))
+    assert loop.ticks == [True] and loop.downs == 0
+
+
 # --- end to end ----------------------------------------------------------------------------------------------------
 
 def test_tunnel_end_to_end_in_rootless_namespaces():

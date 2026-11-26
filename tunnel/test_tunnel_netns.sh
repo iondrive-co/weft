@@ -96,6 +96,15 @@ probe() {
 expect() {  # expect DESCRIPTION WANT GOT
   if [ "$2" = "$3" ]; then ok "$1 -> $3"; else bad "$1: wanted $2, got $3"; fi
 }
+# handshaken: wait up to 10 s for weft-t to exist with a completed handshake, where a fixed sleep could end before
+# run had (re)built it on a loaded host. It returns either way; the probe after it says whether the tunnel works.
+handshaken() {
+  for _ in $(seq 50); do
+    in_c wg show weft-t latest-handshakes 2>/dev/null | awk '$2>0{f=1} END{exit !f}' && return 0
+    sleep 0.2
+  done
+  return 0
+}
 
 # --- server: the files cloud-init writes, then weft-peer admits the client ---
 mkdir -p "$W/srv"
@@ -157,7 +166,7 @@ tun status >/dev/null && bad "status healthy with the interface down" || ok "sta
 
 # The service loop puts back what disappears.
 "${NSC[@]}" python3 -I "$HERE/weft_tunnel.py" --config "$W/cli/t.json" --interval 0.3 run > "$W/run.log" 2>&1 & RUN=$!; pids+=("$RUN")
-sleep 1.5
+handshaken
 expect "run brought the tunnel back" 9.9.9.1 "$(probe selected 9.9.9.2)"
 in_c nft delete table inet weft_t
 in_c ip rule del priority 5270
@@ -165,8 +174,16 @@ sleep 1.2
 grep -q '"restored"' "$W/run.log" && ok "run logged a restore" || bad "run did not log a restore"
 expect "after nft table and rule were deleted" 9.9.9.1 "$(probe selected 9.9.9.2)"
 in_c ip link del weft-t
-sleep 1.5
-expect "after the interface was deleted" 9.9.9.1 "$(probe selected 9.9.9.2)"
+handshaken
+got="$(probe selected 9.9.9.2)"
+expect "after the interface was deleted" 9.9.9.1 "$got"
+if [ "$got" != 9.9.9.1 ]; then  # say why: the restored interface, its handshake, its routes, run's last lines
+  echo "--- diag: run.log"; tail -n 12 "$W/run.log" | sed 's/^/    /' || true
+  echo "--- diag: run alive"; { kill -0 "$RUN" 2>/dev/null && echo "    yes"; } || echo "    no"
+  echo "--- diag: client wg"; { in_c wg show weft-t 2>&1 | sed 's/^/    /'; } || true
+  echo "--- diag: table 30777"; { in_c ip route show table 30777 2>&1 | sed 's/^/    /'; } || true
+  echo "--- diag: probe again"; echo "    $(probe selected 9.9.9.2)"
+fi
 # Stopping the service (SIGTERM, as systemd does) closes the tunnel rather than leaving it open or leaking.
 kill -TERM "$RUN"; wait "$RUN"; rc=$?
 [ "$rc" -eq 0 ] && grep -q '"stopped": "SIGTERM", "mode": "closed"' "$W/run.log" && ok "SIGTERM stops run cleanly, closed" \
